@@ -1,0 +1,284 @@
+﻿diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
+index fb3aa7c..86a46f6 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
+@@ -14,6 +14,10 @@ from vllm.logger import logger
+ from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
+ 
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.tp_kv_broadcast import (
++    TpKvBroadcaster,
++    parse_broadcast_group_ids,
++)
+ 
+ # isort: off
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+@@ -29,6 +33,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
+     get_block_hashes,
+ )
+ # isort: on
++import vllm_ascend.envs as envs_ascend
+ 
+ 
+ def _circular_shift(lst: list, offset: int) -> list:
+@@ -906,6 +911,42 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
+         self.worker = worker
+ 
++        # --- TP-replicated KV cache HCCS broadcast (opt-in) ---
++        # Only kv_cache_group_ids listed here are treated as having
++        # byte-identical content on every TP rank (e.g. an MLA/DSA latent
++        # cache group). dcp_size > 1 is never safe to combine with this
++        # optimization in this revision (DCP may additionally shard a
++        # "replicated" group along the context dimension), so it is
++        # force-disabled in that case regardless of the env var.
++        group_ids = parse_broadcast_group_ids(envs_ascend.VLLM_ASCEND_KV_TP_BROADCAST_GROUPS)
++        if tp_size <= 1 or dcp_size > 1:
++            if group_ids:
++                logger.warning(
++                    "[KVPool][TPBroadcast] Ignoring VLLM_ASCEND_KV_TP_BROADCAST_GROUPS=%r "
++                    "because tp_size=%d dcp_size=%d (broadcast requires tp_size > 1 "
++                    "and dcp_size == 1).",
++                    envs_ascend.VLLM_ASCEND_KV_TP_BROADCAST_GROUPS,
++                    tp_size,
++                    dcp_size,
++                )
++            group_ids = frozenset()
++        self._tp_broadcast_group_ids = group_ids
++        self._tp_broadcaster: TpKvBroadcaster | None = None
++        if self._tp_broadcast_group_ids:
++            self._tp_broadcaster = TpKvBroadcaster(
++                tp_rank=tp_rank,
++                tp_size=tp_size,
++                shard_bytes=envs_ascend.VLLM_ASCEND_KV_TP_BROADCAST_SHARD_BYTES,
++            )
++            logger.info(
++                "[KVPool][TPBroadcast] Enabled for kv_cache_group_ids=%s "
++                "(tp_rank=%d tp_size=%d shard_bytes=%d)",
++                self._tp_broadcast_group_ids,
++                tp_rank,
++                tp_size,
++                envs_ascend.VLLM_ASCEND_KV_TP_BROADCAST_SHARD_BYTES,
++            )
++
+     def _handle_request(self, req_meta: ReqMeta):
+         try:
+             load_spec = req_meta.load_spec
+@@ -928,16 +969,31 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+                 self.set_finished_request(req_id)
+                 return
+ 
++            # Entries for kv_cache_group_ids NOT eligible for TP broadcast:
++            # handled exactly as before (every rank independently reads its
++            # own rotated shard of keys from the remote store).
+             addr_list = []
+             size_list = []
+             key_list = []
+             block_id_list: list[int] = []
++            # Entries for kv_cache_group_ids eligible for TP broadcast
++            # (content is byte-identical on every TP rank, e.g. an MLA/DSA
++            # latent cache group): only tp_rank 0 reads from the remote
++            # store, every rank then gets the data via an HCCS broadcast.
++            # These lists are intentionally left unrotated and must stay in
++            # the same order on every rank for the collective to line up.
++            bcast_addr_list: list[list[int]] = []
++            bcast_size_list: list[list[int]] = []
++            bcast_key_list: list[str] = []
++            bcast_block_id_list: list[int] = []
++
+             group_ids = req_meta.kv_cache_group_ids or [0]
+             load_masks = self.token_database.load_mask(req_meta.block_hashes, token_len)
+             for group_id in group_ids:
+                 block_ids = req_meta.block_ids_by_group[group_id]
+                 group_block_size = self._get_block_size(group_id)
+                 mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
++                is_bcast_group = group_id in self._tp_broadcast_group_ids
+ 
+                 def chunk_filter(start: int, group_id=group_id) -> bool:
+                     return self.token_database.mask_allows_chunk(load_masks, group_id, start)
+@@ -959,71 +1015,134 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+                         kv_cache_group_id=group_id,
+                         block_id=block_id,
+                     )
+-                    key_list.append(key)
+-                    addr_list.append(addr)
+-                    size_list.append(size)
+-                    block_id_list.append(block_id)
+-            if not key_list:
++                    if is_bcast_group:
++                        bcast_key_list.append(key)
++                        bcast_addr_list.append(addr)
++                        bcast_size_list.append(size)
++                        bcast_block_id_list.append(block_id)
++                    else:
++                        key_list.append(key)
++                        addr_list.append(addr)
++                        size_list.append(size)
++                        block_id_list.append(block_id)
++            if not key_list and not bcast_key_list:
+                 self.set_finished_request(req_id)
+                 return
+-            key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
+-            addr_list_c = addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
+-            size_list_c = size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]
+-            block_id_list_c = (
+-                block_id_list[self.tp_rank % len(block_id_list) :] + block_id_list[: self.tp_rank % len(block_id_list)]
+-            )
+-            logger.debug(
+-                "KV pool async recv calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
+-                req_id,
+-                token_len,
+-                req_meta.kv_cache_group_ids or [0],
+-                len(key_list_c),
+-                key_list_c[:3],
+-            )
+-            ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+-            if ret is not None and any(r != 0 for r in ret):
+-                missing_block_ids = record_failed_blocks(
+-                    block_id_list_c,
+-                    ret,
++
++            total_keys = len(key_list) + len(bcast_key_list)
++            if key_list:
++                offset = self.tp_rank % len(key_list)
++                key_list_c = _circular_shift(key_list, offset)
++                addr_list_c = _circular_shift(addr_list, offset)
++                size_list_c = _circular_shift(size_list, offset)
++                block_id_list_c = _circular_shift(block_id_list, offset)
++                logger.debug(
++                    "KV pool async recv calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
++                    req_id,
++                    token_len,
++                    req_meta.kv_cache_group_ids or [0],
++                    len(key_list_c),
++                    key_list_c[:3],
+                 )
+-                if len(req_meta.block_ids_by_group) == 1:
+-                    with self._invalid_block_ids_lock:
+-                        self._invalid_block_ids.update(missing_block_ids)
+-                elif missing_block_ids:
+-                    logger.error(
+-                        "KV load failed for hybrid request %s. "
+-                        "Skip invalid-block fallback to avoid scheduler crash. "
+-                        "failed_blocks=%s",
+-                        req_id,
+-                        missing_block_ids,
+-                    )
+-            elif ret is None:
+-                missing_block_ids = record_failed_blocks(
+-                    block_id_list_c,
+-                    [1] * len(block_id_list_c),
++                ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
++                self._record_get_result(req_meta, ret, block_id_list_c)
++
++            if bcast_key_list:
++                self._handle_broadcast_group_entries(
++                    req_meta,
++                    bcast_key_list,
++                    bcast_addr_list,
++                    bcast_size_list,
++                    bcast_block_id_list,
+                 )
+-                if len(req_meta.block_ids_by_group) == 1:
+-                    with self._invalid_block_ids_lock:
+-                        self._invalid_block_ids.update(missing_block_ids)
+-                elif missing_block_ids:
+-                    logger.error(
+-                        "KV load failed for hybrid request %s. "
+-                        "Skip invalid-block fallback to avoid scheduler crash. "
+-                        "failed_blocks=%s",
+-                        req_id,
+-                        missing_block_ids,
+-                    )
++
+             logger.debug(
+                 "KV pool async recv backend get returned request=%s token_len=%d groups=%s keys=%d",
+                 req_id,
+                 token_len,
+                 req_meta.kv_cache_group_ids or [0],
+-                len(key_list_c),
++                total_keys,
+             )
+             self.set_finished_request(req_id)
+         finally:
+             self.request_queue.task_done()
+ 
++    def _record_get_result(
++        self,
++        req_meta: ReqMeta,
++        ret: list[int] | None,
++        block_id_list_c: list[int],
++    ) -> None:
++        """Shared failure-accounting helper for both the normal-group and
++        broadcast-group `get()` paths. Behavior matches the original
++        (pre-broadcast) inline logic exactly."""
++        if ret is not None and any(r != 0 for r in ret):
++            missing_block_ids = record_failed_blocks(block_id_list_c, ret)
++        elif ret is None:
++            missing_block_ids = record_failed_blocks(block_id_list_c, [1] * len(block_id_list_c))
++        else:
++            return
++        if len(req_meta.block_ids_by_group) == 1:
++            with self._invalid_block_ids_lock:
++                self._invalid_block_ids.update(missing_block_ids)
++        elif missing_block_ids:
++            logger.error(
++                "KV load failed for hybrid request %s. "
++                "Skip invalid-block fallback to avoid scheduler crash. "
++                "failed_blocks=%s",
++                req_meta.req_id,
++                missing_block_ids,
++            )
++
++    def _handle_broadcast_group_entries(
++        self,
++        req_meta: ReqMeta,
++        key_list: list[str],
++        addr_list: list[list[int]],
++        size_list: list[list[int]],
++        block_id_list: list[int],
++    ) -> None:
++        """Rank-0-reads + HCCS-broadcasts the TP-replicated-group entries
++        for one request. Falls back to every rank independently calling
++        `m_store.get` (the pre-broadcast behavior) whenever the
++        broadcaster is unavailable, so this can never silently serve wrong
++        data -- only lose the bandwidth benefit."""
++        req_id = req_meta.req_id
++        broadcaster = self._tp_broadcaster
++        ret: list[int] | None = None
++        ok = True
++        if self.tp_rank == 0:
++            logger.debug(
++                "KV pool async recv (TP broadcast root) calls backend get "
++                "request=%s keys=%d sample_keys=%s",
++                req_id,
++                len(key_list),
++                key_list[:3],
++            )
++            ret = self.m_store.get(key_list, addr_list, size_list)
++            ok = ret is not None and all(r == 0 for r in ret)
++
++        broadcast_done = broadcaster is not None and broadcaster.broadcast_nested(addr_list, size_list, src=0)
++        if broadcast_done:
++            ok = broadcaster.broadcast_status(ok, src=0)
++            if self.tp_rank != 0:
++                # Non-root ranks never talked to the remote store, so they
++                # have no per-key ret codes of their own. Conservatively
++                # mark every block in this batch as failed when the
++                # broadcast status says "not ok", rather than guessing
++                # which key(s) actually failed on rank 0.
++                ret = [0] * len(block_id_list) if ok else [1] * len(block_id_list)
++        elif self.tp_rank != 0:
++            logger.warning(
++                "KV pool async recv (TP broadcast unavailable, falling "
++                "back to per-rank get) request=%s keys=%d",
++                req_id,
++                len(key_list),
++            )
++            ret = self.m_store.get(key_list, addr_list, size_list)
++
++        self._record_get_result(req_meta, ret, block_id_list)
++
+ 
+ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
+     def __init__(
