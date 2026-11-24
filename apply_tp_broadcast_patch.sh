@@ -97,6 +97,10 @@ group across TP ranks), set before launching every TP worker:
     export VLLM_ASCEND_KV_TP_BROADCAST_GROUPS=all
     # optional, defaults to 8 MiB:
     export VLLM_ASCEND_KV_TP_BROADCAST_SHARD_BYTES=8388608
+    # optional, defaults to 0 (local tp_rank 0 of this DP replica's own
+    # TP group); change per-process if the RDMA-affine NPU for a given
+    # DP replica is NOT local tp_rank 0 -- see README for your topology:
+    export VLLM_ASCEND_KV_TP_BROADCAST_ROOT_RANK=0
 
 See README_tp_broadcast.md (shipped next to this script) for full
 details, correctness caveats, and how to verify it on your hardware

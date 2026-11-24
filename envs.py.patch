@@ -1,8 +1,8 @@
-﻿diff --git a/vllm_ascend/envs.py b/vllm_ascend/envs.py
-index b2b334c..837d89f 100644
+diff --git a/vllm_ascend/envs.py b/vllm_ascend/envs.py
+index b1fffba..eb78d8d 100644
 --- a/vllm_ascend/envs.py
 +++ b/vllm_ascend/envs.py
-@@ -100,6 +100,26 @@ env_variables: dict[str, Callable[[], Any]] = {
+@@ -100,6 +100,44 @@ env_variables: dict[str, Callable[[], Any]] = {
      # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
      # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
      "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
@@ -25,6 +25,24 @@ index b2b334c..837d89f 100644
 +    # transfer instead of fully serializing them from the host/Python side.
 +    "VLLM_ASCEND_KV_TP_BROADCAST_SHARD_BYTES": lambda: int(
 +        os.getenv("VLLM_ASCEND_KV_TP_BROADCAST_SHARD_BYTES", str(8 * 1024 * 1024))
++    ),
++    # Which *local* TP rank (0..tp_size-1, scoped to this DP replica's own
++    # TP group, NOT a flattened global rank) acts as the broadcast root for
++    # VLLM_ASCEND_KV_TP_BROADCAST_GROUPS -- i.e. the only rank that actually
++    # calls `m_store.get()` against the remote store before HCCS-broadcasting
++    # to the rest of the group. Defaults to 0.
++    # Only local tp_rank 0 of EVERY DP replica is guaranteed to line up with
++    # the same physical NPU ordering; when dp_size > 1, vLLM lays global
++    # ranks out as contiguous per-DP-replica blocks
++    # (global_rank = dp_rank * tp_size + tp_rank), so different DP replicas'
++    # local tp_rank 0 can land on different *physical* NPUs depending on how
++    # devices are bound to ranks at launch time. If the NPU that is
++    # topologically close to the RDMA NIC for a given DP replica is not that
++    # replica's local tp_rank 0, set this env var (per-process, e.g. from a
++    # launch wrapper keyed off which physical device this process was bound
++    # to) to the correct local tp_rank instead.
++    "VLLM_ASCEND_KV_TP_BROADCAST_ROOT_RANK": lambda: int(
++        os.getenv("VLLM_ASCEND_KV_TP_BROADCAST_ROOT_RANK", "0")
 +    ),
  }
  

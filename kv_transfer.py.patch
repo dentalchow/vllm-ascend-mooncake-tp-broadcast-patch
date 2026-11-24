@@ -1,5 +1,5 @@
-﻿diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
-index fb3aa7c..86a46f6 100644
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
+index 65aaa40..39980b0 100644
 --- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
 +++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
 @@ -14,6 +14,10 @@ from vllm.logger import logger
@@ -21,7 +21,7 @@ index fb3aa7c..86a46f6 100644
  
  
  def _circular_shift(lst: list, offset: int) -> list:
-@@ -906,6 +911,42 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -906,6 +911,65 @@ class KVCacheStoreRecvingThread(KVTransferThread):
          self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
          self.worker = worker
  
@@ -45,6 +45,28 @@ index fb3aa7c..86a46f6 100644
 +                )
 +            group_ids = frozenset()
 +        self._tp_broadcast_group_ids = group_ids
++        # Which *local* TP rank (0..tp_size-1, scoped to this DP replica's
++        # own TP group) acts as the broadcast root, i.e. the only rank that
++        # actually calls `m_store.get()` against the remote store. Defaults
++        # to 0, but is configurable because the rank that is topologically
++        # close to the RDMA NIC (best remote-read bandwidth) is not always
++        # local tp_rank 0 -- e.g. with dp_size>1, vLLM lays ranks out as
++        # contiguous per-DP-replica blocks (global_rank = dp_rank * tp_size
++        # + tp_rank), so DP replica 1's local tp_rank 0 can land on a
++        # different *physical* NPU than DP replica 0's local tp_rank 0.
++        # Set this per-process (e.g. from a launch wrapper keyed off
++        # VLLM_DP_RANK / the physical device id) if the RDMA-affine NPU for
++        # this DP replica is not local tp_rank 0.
++        root_rank = envs_ascend.VLLM_ASCEND_KV_TP_BROADCAST_ROOT_RANK
++        if self._tp_broadcast_group_ids and not (0 <= root_rank < tp_size):
++            logger.warning(
++                "[KVPool][TPBroadcast] VLLM_ASCEND_KV_TP_BROADCAST_ROOT_RANK=%d "
++                "is out of range for tp_size=%d; falling back to root_rank=0.",
++                root_rank,
++                tp_size,
++            )
++            root_rank = 0
++        self._tp_broadcast_root_rank = root_rank
 +        self._tp_broadcaster: TpKvBroadcaster | None = None
 +        if self._tp_broadcast_group_ids:
 +            self._tp_broadcaster = TpKvBroadcaster(
@@ -54,17 +76,18 @@ index fb3aa7c..86a46f6 100644
 +            )
 +            logger.info(
 +                "[KVPool][TPBroadcast] Enabled for kv_cache_group_ids=%s "
-+                "(tp_rank=%d tp_size=%d shard_bytes=%d)",
++                "(tp_rank=%d tp_size=%d root_rank=%d shard_bytes=%d)",
 +                self._tp_broadcast_group_ids,
 +                tp_rank,
 +                tp_size,
++                self._tp_broadcast_root_rank,
 +                envs_ascend.VLLM_ASCEND_KV_TP_BROADCAST_SHARD_BYTES,
 +            )
 +
      def _handle_request(self, req_meta: ReqMeta):
          try:
              load_spec = req_meta.load_spec
-@@ -928,16 +969,31 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -928,16 +992,31 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                  self.set_finished_request(req_id)
                  return
  
@@ -96,7 +119,7 @@ index fb3aa7c..86a46f6 100644
  
                  def chunk_filter(start: int, group_id=group_id) -> bool:
                      return self.token_database.mask_allows_chunk(load_masks, group_id, start)
-@@ -959,71 +1015,134 @@ class KVCacheStoreRecvingThread(KVTransferThread):
+@@ -959,71 +1038,137 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                          kv_cache_group_id=group_id,
                          block_id=block_id,
                      )
@@ -245,9 +268,10 @@ index fb3aa7c..86a46f6 100644
 +        data -- only lose the bandwidth benefit."""
 +        req_id = req_meta.req_id
 +        broadcaster = self._tp_broadcaster
++        root_rank = self._tp_broadcast_root_rank
 +        ret: list[int] | None = None
 +        ok = True
-+        if self.tp_rank == 0:
++        if self.tp_rank == root_rank:
 +            logger.debug(
 +                "KV pool async recv (TP broadcast root) calls backend get "
 +                "request=%s keys=%d sample_keys=%s",
@@ -258,17 +282,19 @@ index fb3aa7c..86a46f6 100644
 +            ret = self.m_store.get(key_list, addr_list, size_list)
 +            ok = ret is not None and all(r == 0 for r in ret)
 +
-+        broadcast_done = broadcaster is not None and broadcaster.broadcast_nested(addr_list, size_list, src=0)
++        broadcast_done = broadcaster is not None and broadcaster.broadcast_nested(
++            addr_list, size_list, src=root_rank
++        )
 +        if broadcast_done:
-+            ok = broadcaster.broadcast_status(ok, src=0)
-+            if self.tp_rank != 0:
++            ok = broadcaster.broadcast_status(ok, src=root_rank)
++            if self.tp_rank != root_rank:
 +                # Non-root ranks never talked to the remote store, so they
 +                # have no per-key ret codes of their own. Conservatively
 +                # mark every block in this batch as failed when the
 +                # broadcast status says "not ok", rather than guessing
-+                # which key(s) actually failed on rank 0.
++                # which key(s) actually failed on the root rank.
 +                ret = [0] * len(block_id_list) if ok else [1] * len(block_id_list)
-+        elif self.tp_rank != 0:
++        elif self.tp_rank != root_rank:
 +            logger.warning(
 +                "KV pool async recv (TP broadcast unavailable, falling "
 +                "back to per-rank get) request=%s keys=%d",

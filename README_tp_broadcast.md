@@ -45,17 +45,71 @@ vllm commit `752a3a504485790a2`（tag `v0.25.1`）的固定版本手写的补丁
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `VLLM_ASCEND_KV_TP_BROADCAST_GROUPS` | `""`（关闭） | 哪些 `kv_cache_group_id` 的内容在所有 TP rank 上是逐字节相同的，可以走广播。`"all"` 表示全部组；`"0,2"` 表示只有 0 和 2 号组。**你的场景（DeepSeek V4 Flash 的 MLA KV，dp=1 tp=4）通常只有一个组，设成 `all` 即可。** |
+| `VLLM_ASCEND_KV_TP_BROADCAST_GROUPS` | `""`（关闭） | 哪些 `kv_cache_group_id` 的内容在所有 TP rank 上是逐字节相同的，可以走广播。`"all"` 表示全部组；`"0,2"` 表示只有 0 和 2 号组。**你的场景（DeepSeek V4 Flash 的 MLA KV）通常只有一个组，设成 `all` 即可。** |
 | `VLLM_ASCEND_KV_TP_BROADCAST_SHARD_BYTES` | `8388608`（8MiB） | 每次 `hcclBroadcast` 调用搬运的最大字节数，用来做流水线分片。 |
+| `VLLM_ASCEND_KV_TP_BROADCAST_ROOT_RANK` | `0` | **哪个 local TP rank**（0..tp_size-1，仅限本 DP 副本自己的 TP 组内编号）负责真正调用 `m_store.get()` 读远端存储，其余 rank 只接收 HCCS 广播。多 DP 副本、RDMA 亲和卡不统一时需要单独配置，见下一节。 |
 
-两个变量需要在**每一个 TP worker 进程**启动前设置好（dp=1 tp=4 场景下就是
-4 个 worker 都要设置），且必须所有 rank 保持一致，否则会出现有的 rank
-以为该走广播、有的 rank 以为不走，导致请求处理方式不一致甚至挂起。
+`GROUPS` / `SHARD_BYTES` 需要在**每一个 TP worker 进程**启动前设置好，
+且必须所有 rank 保持一致，否则会出现有的 rank 以为该走广播、有的 rank
+以为不走，导致请求处理方式不一致甚至挂起。`ROOT_RANK` **可以、且在你的
+拓扑下必须**按进程单独设置（见下一节），同一个 TP 组内的所有 rank 必须
+算出同一个 `ROOT_RANK` 的值，否则没人读/两个人读会直接出错或死锁。
 
 ```bash
 export VLLM_ASCEND_KV_TP_BROADCAST_GROUPS=all
 export VLLM_ASCEND_KV_TP_BROADCAST_SHARD_BYTES=8388608
+export VLLM_ASCEND_KV_TP_BROADCAST_ROOT_RANK=0   # 按你的拓扑调整，见下一节
 ```
+
+## 针对你的拓扑（8 卡 / 2 个 dp / 只有 npu0、npu1 挂 RDMA 网卡）配置 ROOT_RANK
+
+**关键事实：`tp_rank` 是"本 DP 副本自己的 TP 组内编号"，不是全局 rank。**
+vLLM 的并行布局是 `DP x TP`（`vllm/distributed/parallel_state.py` 里
+`initialize_model_parallel`），global rank 按 `dp_rank * tp_size + tp_rank`
+连续分块：
+
+```
+dp_rank=0 的 TP 组 = global rank [0, 1, 2, 3]   (tp_rank 0,1,2,3)
+dp_rank=1 的 TP 组 = global rank [4, 5, 6, 7]   (tp_rank 0,1,2,3)
+```
+
+如果 `global_rank == 物理 NPU 编号`（最常见的默认绑定方式），那么
+**dp1 这个 TP 组里根本不存在 npu0/npu1**——它的 4 个 rank 对应的物理卡是
+npu4~7，local `tp_rank==0` 落在 npu4 上，而不是你说的"亲和"的 npu1。
+这种默认绑定下，`ROOT_RANK` 全部保持默认值 `0` **对 dp1 是不对的**：
+dp1 的广播根会选中 npu4（远离 RDMA 网卡的卡），完全没解决你的问题。
+
+所以要让「dp0 用 npu0 广播、dp1 用 npu1 广播」成立，有两条路，二选一：
+
+1. **（推荐）改变物理设备绑定，让每个 DP 副本的 local tp_rank 0 本来就
+   落在亲和的 NPU 上**，例如让 dp1 这组进程绑定的物理卡顺序是
+   `[1, 3, 5, 7]`（而不是默认的 `[4,5,6,7]`），这样 tp_rank0 自然就是
+   npu1。这通常通过你启动 worker 时设置的 `ASCEND_RT_VISIBLE_DEVICES`
+   （或者 rank table / Ray placement group 里的设备顺序）来做，**不需要
+   改这份补丁的代码**，`ROOT_RANK` 全部保持默认 `0` 即可。
+2. **如果物理设备绑定没法按上面这样调整**（比如受限于其他约束，
+   dp1 的 4 个 worker 物理上就是 npu4~7，npu1 根本不在这个 TP 组里），
+   那么**这份补丁目前的设计是无法满足"跨 DP 组借用另一组的 NPU 做广播
+   根"这个需求的**——HCCL/HCCS 广播只能在同一个 TP 通信组内部的 rank
+   之间做，npu1 如果不属于 dp1 的 TP 组，就不可能成为 dp1 的广播根。
+   这种情况下 dp1 只能退而求其次：在 dp1 自己的 4 张卡（npu4~7）里选一
+   个相对离 RDMA 最近的（哪怕也不理想）作为 `ROOT_RANK`，设置方式是
+   每个 worker 进程启动前按自己的 `tp_rank`/物理设备号设置：
+   ```bash
+   # 伪代码：在你的启动脚本里，按进程算出 ROOT_RANK 再 export
+   # dp0 的 4 个 worker: ROOT_RANK 都设为 0 (local tp_rank0 = npu0，已经是亲和卡)
+   # dp1 的 4 个 worker: 从 npu4~7 里选一个最近似亲和的 local tp_rank 设为 ROOT_RANK
+   export VLLM_ASCEND_KV_TP_BROADCAST_ROOT_RANK=<该进程所在DP组里最优local tp_rank>
+   ```
+   这种情况下收益会小于"亲和卡能复用"的理想场景，因为广播根本身读远端
+   时也要走非亲和的 RDMA 路径。
+
+**怎么验证你当前到底是哪种情况**：在每个 worker 进程启动时打印一下
+`tp_rank` 和它实际绑定到的物理 NPU 设备号（例如 `torch_npu.npu.current_device()`
+或者你启动脚本里设置的可见设备顺序），确认 dp0/dp1 各自的 `tp_rank==0`
+进程是不是真的分别落在 npu0/npu1 上。如果是，直接用默认配置（全部
+`ROOT_RANK=0`）即可，不需要额外设置；如果不是，按方案 1 调整设备绑定
+优先于方案 2 改 `ROOT_RANK`。
 
 ## 重要限制（上线前务必确认）
 
