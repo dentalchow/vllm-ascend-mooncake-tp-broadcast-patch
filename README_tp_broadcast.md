@@ -180,6 +180,7 @@ mooncake_tp_broadcast_patch/
 ├── kv_transfer.py.patch            # unified diff, git apply 使用
 ├── envs.py.patch                   # unified diff, git apply 使用
 ├── apply_tp_broadcast_patch.sh     # 一键应用脚本
+├── hccs_p2p_bandwidth_probe.py     # 独立预检脚本，不依赖本补丁
 └── README_tp_broadcast.md          # 本文件
 ```
 
@@ -189,3 +190,77 @@ mooncake_tp_broadcast_patch/
 `envs.py` / `tp_kv_broadcast.py`）编译通过，没有语法错误。**但没有
 在真实 vllm-ascend 运行环境（含 torch_npu / Mooncake / 真实 NPU）里
 跑过**，这是你在服务器上验证时需要重点关注的部分。
+
+## 进阶方案："npu1 代读 + HCCS 转发进 dp1"（尚未实现，先做预检）
+
+如果你的约束是：TP 组内的物理设备必须保持连续分块（dp0=npu0~3,
+dp1=npu4~7，这通常是为了保证**计算期间**的 TP 通信走最优的 HCCS 路径，
+不能为了 KV 加载这一个场景牺牲它），那么本补丁现在的
+`VLLM_ASCEND_KV_TP_BROADCAST_ROOT_RANK` 机制就帮不上 dp1 了——因为 npu1
+根本不在 dp1 的 TP 通信组里，没法被设成 dp1 的 `ROOT_RANK`。
+
+你提出的思路（npu1 代替 dp1 去读远端，再把数据转发进 dp1 内部广播）
+架构上是对的，但比当前补丁复杂得多，核心是需要新增三块现在完全没有
+的能力：
+
+1. **一次性的跨进程小通信域**：dp0 的 npu1 进程和 dp1 的 npu4 进程
+   今天互不通信。需要在启动时做一次 8 个 rank 全员参与的 collective，
+   建立一个只包含 `{npu1, npu4}` 两个 global rank 的 2-rank HCCL
+   子通信域（复用 `PyHcclCommunicator` 同一套机制，只是绑定到这个更
+   小的 process group 上，不需要新增任何 ctypes 绑定——2 节点的
+   `hcclBroadcast` 在语义上就是一次点对点发送）。
+2. **控制面消息**：npu1 并不知道 dp1 这次要读哪些 key，dp1 的
+   root(npu4) 必须先把 `key_list`/`size_list` 这些**元数据**发给
+   npu1，npu1 读完之后还要发一个"完成/失败"状态回去——这一跳建议走
+   一个同样范围的 2-rank gloo（CPU）子 group，和搬运 KV 大数据的
+   HCCL 通道分开，避免小消息和大数据抢同一个通道的调度。
+3. **并发/排队语义**：npu1 本身要继续正常服务 dp0 自己的请求，现在
+   还要兼顾 dp1 的代读请求，两边请求在时间上会并发到达，这个
+   2-rank 通道需要请求序列号/排队，否则会出现跨请求数据串掉的 bug。
+
+这三块合起来的代码量/复杂度大概是当前这版 patch 的 2~3 倍，而且风险
+也从"单进程内的逻辑 bug"变成"跨进程同步没对齐导致死锁或串数据"，
+排查难度高一个量级。**在投入这个工作量之前，有一个硬性前提必须先
+确认**：npu1 和 npu4~7 是不是真的在同一个 HCCS 全互联域里（同一张板
+子 / 同一个 HCCS switch 下）。如果这一跳本身带宽就不行（比如实际上
+是两块 4 卡板子，板间只有较慢的链路），那整个代理转发方案就只是把
+瓶颈从 RDMA 网卡搬到了 NPU-NPU 链路上，白费工夫。
+
+为此仓库里新增了一个**不依赖这份 KV 补丁、可以单独运行**的预检脚本：
+
+```
+hccs_p2p_bandwidth_probe.py
+```
+
+用法（在同一台机器上开两个终端）：
+
+```bash
+# 终端 A：绑定物理 npu1，作为 broadcast 的 src
+python3 hccs_p2p_bandwidth_probe.py --rank 0 --device 1 \
+    --master-addr 127.0.0.1 --master-port 29500
+
+# 终端 B：绑定物理 npu4，接收 broadcast
+python3 hccs_p2p_bandwidth_probe.py --rank 1 --device 4 \
+    --master-addr 127.0.0.1 --master-port 29500
+```
+
+默认每次搬 1GiB（贴近你"一次加载 KV cache 约 1GB"的量级），跑 20 轮
+取平均/最小/最大 GB/s。建议先跑一组 `--device 0 --device 1`（同板，
+预期应该是几百 GB/s 的 HCCS 全速）作为基线，再跑 `--device 1 --device 4`
+做对比：
+
+- 如果 npu1↔npu4 的数字和 npu0↔npu1 基本在同一量级（大几十到几百
+  GB/s），说明这两颗芯片确实在同一个 HCCS 全互联域里，代理转发方案
+  值得投入实现。
+- 如果 npu1↔npu4 的数字明显低很多（个位数 GB/s，或者接近你 RDMA 网卡
+  的线速），说明这两颗芯片之间走的不是板载 HCCS 全速链路（可能是
+  跨板/跨机箱的慢速互联，甚至根本不直连，走的是 PCIe/走网络兜底），
+  这个方案就不值得做了，应该优先考虑给 dp1 单独配一张 RDMA 网卡（硬件
+  改造）这条路。
+
+**把探测结果告诉我（或者直接告诉我"假设是同一 HCCS 全互联域，直接实现
+代理转发方案"），我再继续实现完整的跨进程 relay。** 在没有真实 NPU
+硬件的沙箱环境里，这类跨进程同步代码没法被我自己跑通验证，贸然写几百
+行untested 的跨进程协调代码直接塞进你的生产 KV 加载路径风险偏高，所以
+这一步我想先用一个低风险、你能立刻跑的探测脚本把关键假设确认清楚，
+再决定是否值得投入完整实现。
