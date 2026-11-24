@@ -111,6 +111,20 @@ dp1 的广播根会选中 npu4（远离 RDMA 网卡的卡），完全没解决�
 `ROOT_RANK=0`）即可，不需要额外设置；如果不是，按方案 1 调整设备绑定
 优先于方案 2 改 `ROOT_RANK`。
 
+### 更新：开启 PCIe Relaxed Ordering (RO) 之后，这一节其实可以不用管了
+
+后续确认：在 RDMA 网卡 / NPU 侧开启 PCIe **Relaxed Ordering** 之后，
+跨 NUMA/跨 socket 读远端 KV cache 的带宽已经打满了，不再存在"只有
+npu0/npu1 这两张卡读远端快、其余卡读远端慢"的差异。也就是说，**广播根
+选哪张物理卡，对读远端这一跳的带宽已经没有影响**——`ROOT_RANK` 不需要
+再按"哪张卡离 RDMA 网卡近"去抠，每个 DP 副本直接用默认值
+`ROOT_RANK=0`（即本 DP 副本自己 TP 组内的 local tp_rank 0：dp0 是
+npu0，dp1 是 npu4）即可：每个 DP 副本各自的 tp_rank0 读一次远端、在
+自己的 4 张卡内部 HCCS 广播，两个 DP 副本完全独立、互不依赖，不需要
+任何跨 DP 组的转发。下面"进阶方案"一节描述的 npu1 代读+转发机制**不再
+需要实现**，保留在文档里仅作为以后遇到类似"部分 rank 读远端带宽不均"
+场景时的参考设计。
+
 ## 重要限制（上线前务必确认）
 
 1. **只对"逐 rank 内容相同"的 KV 组安全。** 这在 MLA/DSA 类 latent cache
@@ -191,7 +205,13 @@ mooncake_tp_broadcast_patch/
 在真实 vllm-ascend 运行环境（含 torch_npu / Mooncake / 真实 NPU）里
 跑过**，这是你在服务器上验证时需要重点关注的部分。
 
-## 进阶方案："npu1 代读 + HCCS 转发进 dp1"（尚未实现，先做预检）
+## 进阶方案（已不需要）："npu1 代读 + HCCS 转发进 dp1"
+
+> **状态：不需要实现。** 开启 PCIe Relaxed Ordering 后，跨 NUMA/socket
+> 读远端 KV cache 的带宽已经打满，每个 DP 副本用自己默认的
+> `ROOT_RANK=0`（本组 local tp_rank 0）独立读远端+组内广播即可，完全
+> 不需要借用另一组的 npu1 做跨 DP 代读转发。本节保留作为设计参考，
+> 以后如果再遇到"部分 rank 读远端带宽明显不均"的场景可以回来看。
 
 如果你的约束是：TP 组内的物理设备必须保持连续分块（dp0=npu0~3,
 dp1=npu4~7，这通常是为了保证**计算期间**的 TP 通信走最优的 HCCS 路径，
